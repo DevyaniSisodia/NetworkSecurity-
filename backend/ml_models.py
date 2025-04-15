@@ -1,9 +1,6 @@
 import numpy as np
 import pandas as pd
-import tensorflow as tf
-from tensorflow.keras.models import Sequential, load_model
-from tensorflow.keras.layers import LSTM, Dense, Dropout
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import MinMaxScaler, OneHotEncoder
 from sklearn.model_selection import train_test_split
 import joblib
@@ -21,7 +18,6 @@ class CyberThreatPredictor:
         self.feature_scaler = None
         self.target_encoder = None
         self.lookback_days = 30  # How many days of data to use for prediction
-        self.sequence_length = 7  # Sequence length for LSTM
         
         if model_path:
             self.load_model(model_path)
@@ -81,9 +77,17 @@ class CyberThreatPredictor:
         daily_data['day_of_month'] = pd.to_datetime(daily_data['date']).dt.day
         daily_data['month'] = pd.to_datetime(daily_data['date']).dt.month
         
+        # Create lag features (instead of LSTM sequences)
+        for lag in range(1, 8):
+            daily_data[f'severity_lag_{lag}'] = daily_data['severity'].shift(lag)
+            daily_data[f'threat_count_lag_{lag}'] = daily_data['threat_count'].shift(lag)
+        
+        # Drop rows with NaN values from the lag features
+        daily_data = daily_data.dropna()
+        
         # One-hot encode categorical features
         categorical_features = ['target_sector', 'target_technology']
-        self.target_encoder = OneHotEncoder(sparse=False, handle_unknown='ignore')
+        self.target_encoder = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
         encoded_cats = self.target_encoder.fit_transform(daily_data[categorical_features])
         
         # Get the feature names
@@ -96,73 +100,51 @@ class CyberThreatPredictor:
         daily_data = daily_data.reset_index(drop=True)
         daily_data = pd.concat([daily_data, encoded_df], axis=1)
         
+        # Prepare target variables
+        # Determine severity level: 0 (low), 1 (medium), 2 (high)
+        daily_data['severity_level'] = pd.cut(
+            daily_data['severity'], 
+            bins=[-float('inf'), 4.0, 7.0, float('inf')], 
+            labels=[0, 1, 2]
+        ).astype(int)
+        
+        # Get the sector and technology indices
+        daily_data['sector_idx'] = daily_data['target_sector'].apply(
+            lambda x: list(self.target_encoder.categories_[0]).index(x) if x in self.target_encoder.categories_[0] else 0
+        )
+        daily_data['tech_idx'] = daily_data['target_technology'].apply(
+            lambda x: list(self.target_encoder.categories_[1]).index(x) if x in self.target_encoder.categories_[1] else 0
+        )
+        
         # Select features for the model
-        feature_columns = ['severity', 'threat_count', 'day_of_week', 'day_of_month', 'month'] + list(encoded_feature_names)
+        lag_features = [f'severity_lag_{lag}' for lag in range(1, 8)] + [f'threat_count_lag_{lag}' for lag in range(1, 8)]
+        feature_columns = ['day_of_week', 'day_of_month', 'month'] + lag_features + list(encoded_feature_names)
         features = daily_data[feature_columns]
+        
+        # Targets
+        targets = daily_data[['sector_idx', 'tech_idx', 'severity_level']]
         
         # Scale numerical features
         self.feature_scaler = MinMaxScaler()
         scaled_features = self.feature_scaler.fit_transform(features)
         
-        # Create sequences for LSTM
-        X, y = self._create_sequences(scaled_features, daily_data)
-        
-        return X, y
+        return scaled_features, targets
     
-    def _create_sequences(self, scaled_data, daily_data):
-        """Create sequences for LSTM training"""
-        X, y = [], []
+    def build_model(self):
+        """Build a Random Forest model for threat prediction"""
+        # We'll use multiple Random Forest classifiers, one for each prediction target
+        sector_model = RandomForestClassifier(n_estimators=100, random_state=42)
+        tech_model = RandomForestClassifier(n_estimators=100, random_state=42)
+        severity_model = RandomForestClassifier(n_estimators=100, random_state=42)
         
-        for i in range(len(scaled_data) - self.sequence_length):
-            # Input sequence
-            seq = scaled_data[i:i + self.sequence_length]
-            X.append(seq)
-            
-            # Target: predicting if there will be a high-severity threat in the next day
-            # We'll consider severity > 7.0 as high
-            next_day = i + self.sequence_length
-            target_sector = daily_data.iloc[next_day]['target_sector']
-            target_tech = daily_data.iloc[next_day]['target_technology']
-            severity = daily_data.iloc[next_day]['severity']
-            
-            # Create a target vector [sector_index, technology_index, severity_level]
-            # We'll simplify this for the demo, but you could use more complex targets
-            sector_idx = list(self.target_encoder.categories_[0]).index(target_sector) if target_sector in self.target_encoder.categories_[0] else 0
-            tech_idx = list(self.target_encoder.categories_[1]).index(target_tech) if target_tech in self.target_encoder.categories_[1] else 0
-            
-            # Severity level: 0 (low), 1 (medium), 2 (high)
-            if severity > 7.0:
-                sev_level = 2  # High
-            elif severity > 4.0:
-                sev_level = 1  # Medium
-            else:
-                sev_level = 0  # Low
-                
-            y.append([sector_idx, tech_idx, sev_level])
-        
-        return np.array(X), np.array(y)
+        return {
+            'sector': sector_model,
+            'tech': tech_model,
+            'severity': severity_model
+        }
     
-    def build_model(self, input_shape, output_shape):
-        """Build the LSTM model architecture"""
-        model = Sequential([
-            LSTM(64, return_sequences=True, input_shape=input_shape),
-            Dropout(0.2),
-            LSTM(32),
-            Dropout(0.2),
-            Dense(32, activation='relu'),
-            Dense(output_shape, activation='softmax')
-        ])
-        
-        model.compile(
-            optimizer='adam',
-            loss='sparse_categorical_crossentropy',
-            metrics=['accuracy']
-        )
-        
-        return model
-    
-    def train(self, epochs=50, batch_size=32):
-        """Train the LSTM model on threat data"""
+    def train(self):
+        """Train the prediction models on threat data"""
         X, y = self.preprocess_data()
         
         if X is None or len(X) == 0:
@@ -172,31 +154,29 @@ class CyberThreatPredictor:
         # Split the data
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
         
-        # Build the model
-        input_shape = (X_train.shape[1], X_train.shape[2])
-        output_shape = y_train.shape[1]
-        self.model = self.build_model(input_shape, output_shape)
+        # Build the models
+        self.model = self.build_model()
         
-        # Set up callbacks
-        callbacks = [
-            EarlyStopping(patience=5, restore_best_weights=True),
-            ModelCheckpoint('models/best_threat_model.h5', save_best_only=True)
-        ]
+        # Train each model on its respective target
+        self.model['sector'].fit(X_train, y_train['sector_idx'])
+        self.model['tech'].fit(X_train, y_train['tech_idx'])
+        self.model['severity'].fit(X_train, y_train['severity_level'])
         
-        # Train the model
-        history = self.model.fit(
-            X_train, y_train,
-            epochs=epochs,
-            batch_size=batch_size,
-            validation_data=(X_test, y_test),
-            callbacks=callbacks
-        )
+        # Evaluate the models
+        sector_acc = self.model['sector'].score(X_test, y_test['sector_idx'])
+        tech_acc = self.model['tech'].score(X_test, y_test['tech_idx'])
+        severity_acc = self.model['severity'].score(X_test, y_test['severity_level'])
+        
+        logger.info(f"Model accuracy - Sector: {sector_acc:.4f}, Tech: {tech_acc:.4f}, Severity: {severity_acc:.4f}")
         
         # Save the model and preprocessing objects
         self.save_model('models/threat_predictor')
         
-        # Return training history
-        return history.history
+        return {
+            'sector_accuracy': sector_acc,
+            'tech_accuracy': tech_acc,
+            'severity_accuracy': severity_acc
+        }
     
     def predict_threats(self, days_ahead=7):
         """Predict threats for the specified number of days ahead"""
@@ -213,18 +193,26 @@ class CyberThreatPredictor:
         # Prepare the data for prediction
         X_pred = self._prepare_prediction_data(recent_data)
         
+        if X_pred is None:
+            return []
+        
         # Make predictions
         predictions = []
+        last_data = recent_data.iloc[-1].copy()  # Start with the most recent real data
+        
         for i in range(days_ahead):
-            # Predict the next day
-            pred = self.model.predict(X_pred[-1:])
+            # Predict using the trained models
+            sector_idx = self.model['sector'].predict([X_pred])[0]
+            tech_idx = self.model['tech'].predict([X_pred])[0]
+            severity_level = self.model['severity'].predict([X_pred])[0]
             
-            # Decode the prediction
-            sector_idx = np.argmax(pred[0, :len(self.target_encoder.categories_[0])])
-            tech_start = len(self.target_encoder.categories_[0])
-            tech_end = tech_start + len(self.target_encoder.categories_[1])
-            tech_idx = np.argmax(pred[0, tech_start:tech_end])
-            severity_level = np.argmax(pred[0, tech_end:])
+            # Get prediction confidences
+            sector_proba = np.max(self.model['sector'].predict_proba([X_pred])[0])
+            tech_proba = np.max(self.model['tech'].predict_proba([X_pred])[0])
+            severity_proba = np.max(self.model['severity'].predict_proba([X_pred])[0])
+            
+            # Average confidence score
+            confidence = (sector_proba + tech_proba + severity_proba) / 3 * 100
             
             # Map back to original categories
             sector = self.target_encoder.categories_[0][sector_idx]
@@ -251,7 +239,7 @@ class CyberThreatPredictor:
                 'target_technology': technology,
                 'attack_type': attack_type,
                 'severity': severity,
-                'confidence': float(np.max(pred[0])) * 100  # Convert to percentage
+                'confidence': float(confidence)
             }
             
             predictions.append(prediction)
@@ -262,15 +250,47 @@ class CyberThreatPredictor:
                 target_sector=sector,
                 target_technology=technology,
                 attack_type=attack_type,
-                confidence=float(np.max(pred[0])) * 100,
+                confidence=float(confidence),
                 predicted_timeframe=f"{i+1}d",
                 features_used=json.dumps(list(recent_data.columns)),
-                model_version="LSTM-v1"
+                model_version="RF-v1"
             )
             self.db.add(db_prediction)
+            
+            # Update features for next prediction (simple simulation)
+            # For a true forecast, you would need more sophisticated methods
+            X_pred = self._update_prediction_features(X_pred, sector_idx, tech_idx, severity_level)
         
         self.db.commit()
         return predictions
+    
+    def _update_prediction_features(self, X_pred, sector_idx, tech_idx, severity_level):
+        """Update the prediction features for the next step in forecasting"""
+        # This is a simplified approach. In a real system, 
+        # you'd use a more sophisticated time series forecasting approach.
+        
+        # Map severity level back to a score
+        if severity_level == 2:
+            severity = 8.5
+        elif severity_level == 1:
+            severity = 5.5
+        else:
+            severity = 3.0
+        
+        # Shift lag features (like a sliding window)
+        new_X = X_pred.copy()
+        
+        # Update lag features (assuming first 14 features after day/month/week are the lags)
+        # This is a simplification - real implementation would be more precise
+        for i in range(6):  # Shift the severity lags
+            new_X[i] = new_X[i+1]
+        new_X[6] = severity / 10.0  # Normalize severity
+        
+        for i in range(7, 13):  # Shift the threat count lags
+            new_X[i] = new_X[i+1]
+        new_X[13] = 0.5  # Simplified threat count prediction
+        
+        return new_X
             
     def _get_recent_data(self):
         """Get the most recent threat data for prediction"""
@@ -318,6 +338,21 @@ class CyberThreatPredictor:
     
     def _prepare_prediction_data(self, recent_data):
         """Prepare recent data for prediction"""
+        if len(recent_data) < 8:  # We need at least 7 days for lag features
+            logger.warning("Insufficient recent data for prediction (need at least 7 days)")
+            return None
+            
+        # Create lag features
+        for lag in range(1, 8):
+            recent_data[f'severity_lag_{lag}'] = recent_data['severity'].shift(lag)
+            recent_data[f'threat_count_lag_{lag}'] = recent_data['threat_count'].shift(lag)
+        
+        # Drop rows with NaN values
+        recent_data = recent_data.dropna()
+        
+        if recent_data.empty:
+            return None
+        
         # One-hot encode categorical features
         categorical_features = ['target_sector', 'target_technology']
         encoded_cats = self.target_encoder.transform(recent_data[categorical_features])
@@ -332,25 +367,21 @@ class CyberThreatPredictor:
         recent_data = recent_data.reset_index(drop=True)
         recent_data = pd.concat([recent_data, encoded_df], axis=1)
         
-        # Select features for the model
-        feature_columns = ['severity', 'threat_count', 'day_of_week', 'day_of_month', 'month'] + list(encoded_feature_names)
+        # Select features for the model (same as in training)
+        lag_features = [f'severity_lag_{lag}' for lag in range(1, 8)] + [f'threat_count_lag_{lag}' for lag in range(1, 8)]
+        feature_columns = ['day_of_week', 'day_of_month', 'month'] + lag_features + list(encoded_feature_names)
         features = recent_data[feature_columns]
         
         # Scale numerical features
         scaled_features = self.feature_scaler.transform(features)
         
-        # Create sequences for LSTM
-        sequences = []
-        for i in range(len(scaled_features) - self.sequence_length + 1):
-            seq = scaled_features[i:i + self.sequence_length]
-            sequences.append(seq)
-        
-        return np.array(sequences)
+        # Return the most recent data point for prediction
+        return scaled_features[-1]
     
     def save_model(self, model_path):
         """Save the model and preprocessing objects"""
         if self.model:
-            self.model.save(f"{model_path}.h5")
+            joblib.dump(self.model, f"{model_path}.pkl")
             joblib.dump(self.feature_scaler, f"{model_path}_scaler.pkl")
             joblib.dump(self.target_encoder, f"{model_path}_encoder.pkl")
             logger.info(f"Model saved to {model_path}")
@@ -362,7 +393,7 @@ class CyberThreatPredictor:
     def load_model(self, model_path):
         """Load the model and preprocessing objects"""
         try:
-            self.model = load_model(f"{model_path}.h5")
+            self.model = joblib.load(f"{model_path}.pkl")
             self.feature_scaler = joblib.load(f"{model_path}_scaler.pkl")
             self.target_encoder = joblib.load(f"{model_path}_encoder.pkl")
             logger.info(f"Model loaded from {model_path}")
